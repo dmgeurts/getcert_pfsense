@@ -1,0 +1,147 @@
+#!/bin/bash
+
+## Logging
+LOG="/var/log/pfs_instcert.log"
+wlog() {
+    printf "$*"
+    printf "[$(date --rfc-3339=seconds)]: $*" >> "$LOG"
+}
+trap 'wlog "ERROR - Certificate installation failed.\n"' TERM HUP
+
+## Usage info
+show_help() {
+cat << EOF
+Usage: ${0##*/} [-hv] -c CERT_CN -a CRED_FILE FQDN
+This script uploads a certificate issued by ipa-getcert to a pfSense appliance
+via ssh/scp.
+
+    FQDN          Fully qualified name of the pfSense appliance mgmt interface.
+                  Must be reachable from this host on port TCP/22.
+    -c CERT_CN    REQUIRED. Common Name (Subject) of the certificate, to find
+                  the certificate and key files.
+    -a CRED_FILE  File with the pfSense admin/root private key.
+                  Defaults to /etc/ipa/.pfsrc
+
+    -h            Display this help and exit.
+    -v            Verbose mode.
+EOF
+}
+
+## Fixed variables
+VERBOSE=0
+OPTIND=1
+
+## Read/interpret optional arguments
+while getopts c:a:vh opt; do
+    case $opt in
+        c)  CERT_CN=$OPTARG
+            ;;
+        v)  VERBOSE=$((VERBOSE+1))
+            ;;
+        a)  CRED_FILE=$OPTARG
+            ;;
+        h)  show_help
+            exit 0
+            ;;
+        *)  show_help >&2
+            exit 1
+            ;;
+    esac
+done
+shift "$((OPTIND-1))"   # Discard the options and sentinel --
+
+## This script must be run as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit
+fi
+
+## Start logging
+wlog "START of pfs_instcert.\n"
+
+# Check that a Common Name name was given
+if [[ -z $CERT_CN ]]; then
+    wlog "ERROR: Missing -c, a certificate requires a Common Name.\n\n"
+    show_help >&2
+    exit 1
+elif grep -q -P '(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{1,63}(?<!-)\.)+[a-zA-Z]{2,63}$)' <<< "$CERT_CN"; then
+    CERT_CN=${CERT_CN,,}
+    wlog "Certificate Common Name: $CERT_CN\n"
+fi
+
+# Check that credentials are available
+CRED_FILE=${CRED_FILE:=/etc/ipa/.pfsrc}
+if [[ ! -f "$CRED_FILE" ]]; then
+    wlog "ERROR: File not found: $CRED_FILE\n"
+    exit 5
+elif [ $(grep "OPENSSH PRIVATE KEY" "$CRED_FILE" -c) -ne 2 ]; then
+    wlog "ERROR: No key header found: $CRED_FILE\n"
+    exit 5
+else
+    (( $VERBOSE > 0 )) && wlog "Private key found in: $CRED_FILE\n"
+fi
+
+# Check that a single valid FQDN was parsed for pfSense management
+if grep -q -P '(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$)' <<< "$@"; then
+    PFS_MGMT="${@,,}"
+    (( $VERBOSE > 0 )) && wlog "PFS_MGMT: $PFS_MGMT\n"
+    if ! nc -z $PFS_MGMT 22 2>/dev/null; then
+        wlog "ERROR: pfSense appliance unreachable at: ssh://$PFS_MGMT/ (tcp/22)\n"
+        exit 4
+    fi
+else
+    wlog "ERROR: A valid FQDN is required to issue a certificate.\n"
+    wlog "Parsed string: $@\n\n"
+    show_help >&2
+    exit 4
+fi
+
+## Upload and install the certificate to the pfSense appliance.
+# Verify state of the certificate is MONITORING or POST_SAVED_CERT
+KEY_FILE="/etc/ssl/private/${CERT_CN}.key"
+CRT_FILE="/etc/ssl/certs/${CERT_CN}.crt"
+CERT_STATUS=$(ipa-getcert status -f "$CRT_FILE" -v)
+# Verify both certificate and key files exist
+if [[ ! -f "$KEY_FILE" ]] || [[ ! -f "$CRT_FILE" ]]; then
+    wlog "ERROR: Missing certificate or key files. Check if the following files exist:\n"
+    wlog "Key file: $KEY_FILE\nCert file: $CRT_FILE\n"
+    exit 10
+elif ! [[ "$CERT_STATUS" =~ (MONITORING|POST_SAVED_CERT) ]]; then
+    wlog 'ERROR: Problem encountered with the requested certificate.\nInstallation aborted, verify that the certificate status is "MONITORING".\n'
+    exit 11
+else
+    (( $VERBOSE > 0 )) && wlog "Certmonger certificate ${CERT_STATUS,}\n"
+    KEY="$(cat $KEY_FILE | base64 -w 0)"
+    CRT="$(cat $CRT_FILE | base64 -w 0)"
+    # replace the placeholder string in the pattern template with certificate information.
+    # awk is used because of the escape characters aren't passed via sed.
+    SCP_FILE="/tmp/${CERT_CN}.sub"
+#    printf '/.*%s.*/{\nN\nN\n' "$CERT_CN" > "$SCP_FILE"
+    printf '/.*%s.*/{\nN\nN\n' "fw04-mgmt-2021" > "$SCP_FILE"
+    printf '/<crt>.*<\/crt>/{\ns//<crt>%s<\/crt>/\n}\nN\nN\n' "$CRT" >> "$SCP_FILE"
+    printf '/<prv>.*<\/prv>/{\ns//<prv>%s<\/prv>/\nP\nD\n}\n}' "$KEY" >> "$SCP_FILE"
+fi
+
+# Upload it to the pfSense appliance
+SSH_OPTS="-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $CRED_FILE"
+scp $SSH_OPTS "$SCP_FILE" root@$PFS_MGMT:/tmp/pattern.sub
+SCP_STATUS=$?
+(( $VERBOSE > 0 )) && wlog "Result of SCP upload of certificate: $SCP_STATUS\n"
+if [ $SCP_STATUS -eq 0 ]; then
+    ssh $SSH_OPTS $PFS_MGMT \
+        'cp /conf/config.xml /tmp/config.xml && sed -f /tmp/pattern.sub < /tmp/config.xml > /conf/config.xml && \
+        rm /tmp/config.xml && rm /tmp/config.cache && /etc/rc.restart_webgui'
+    SSH_STATUS=$?
+    (( $VERBOSE > 0 )) && wlog "Config update and UI restart output: $SSH_STATUS\n"
+    if [ $SSH_STATUS -eq 0 ]; then
+        wlog "Finished upload and activation of certificate for: $CERT_CN\n"
+    else
+        wlog "ERROR: Activation of certificate failed.\n"
+        exit 12
+    fi
+else
+    wlog "ERROR: Upload of certificate failed.\n"
+    exit 12
+fi
+
+wlog "END - Finished certificate installation to: $PFS_MGMT\n"

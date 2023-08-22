@@ -1,0 +1,239 @@
+#!/bin/bash
+
+## Usage info
+show_help() {
+cat << EOF
+Usage: ${0##*/} [-hv] -c CERT_CN [-a CRED_FILE] [OPTIONS] [FQDN]
+This script requests a certificate from FreeIPA using ipa-getcert and calls a
+partner script to deploy the certificate to a pfSense appliance via ssh/scp.
+
+    FQDN              Fully qualified name of the pfSense appliance web interface.
+                      Must be reachable from this host on port TCP/22. Defaults
+                      to CERT_CN if omitted.
+    -c CERT_CN        REQUIRED. Common Name (Subject) of the certificate (must be a
+                      FQDN). Will also present in the certificate as a SAN.
+    -a CRED_FILE      File with the pfSense admin/root privte key.
+                      Defaults to /etc/ipa/.pfsrc
+OPTIONS:
+    -i                Resolve CERT_CN to an IP address, for inclusion in the SAN.
+    -I IP4            IPv4 address of the pfSense server, for inclusion in the SAN.
+    -S SERVICE        Service of the Service Principal. Default: HTTP.
+    -T CERT_PROFILE   Ask IPA to process the request using the named profile or
+                      template.
+    -G TYPE           Type of key to be generated if one is not already in place.
+                      IPA CA uses RSA by default. (RSA, DSA, EC or ECDSA)
+    -b BITS           In case a new key pair needs to be generated, this option
+                      specifies the size of the key. Default: 2048 (RSA/DSA).
+                      EC: 256, 384 or 512. See certmonger.conf for the default.
+
+    -h                Display this help and exit.
+    -v                Verbose mode.
+EOF
+}
+
+## Fixed variables
+INST_CERT="/usr/local/bin/pfs_instcert"
+VERBOSE=0
+OPTIND=1
+
+## Read/interpret optional arguments
+while getopts c:a:iI:S:T:G:b:vh opt; do
+    case $opt in
+        c)  CERT_CN=$OPTARG
+            ;;
+        a)  CRED_FILE=$OPTARG
+            ;;
+        i)  IP4="CERT_CN"
+            ;;
+        I)  IP4=$OPTARG
+            ;;
+        S)  SERVICE=$OPTARG
+            ;;
+        T)  CERT_PROFILE=$OPTARG
+            ;;
+        G)  TYPE=$OPTARG
+            ;;
+        b)  BITS=$OPTARG
+            ;;
+        v)  VERBOSE=$((VERBOSE+1))
+            ;;
+        h)  show_help
+            exit 0
+            ;;
+        *)  show_help >&2
+            exit 1
+            ;;
+    esac
+done
+shift "$((OPTIND-1))"   # Discard the options and sentinel --
+
+## The user must have sudo rights for ipa-getcert
+if ! sudo ipa-getcert list &> /dev/null; then
+    echo "Please ensure you have sudo privileges for ipa-getcert"
+    exit 1
+fi
+
+# Check that a Common Name name was given
+if [[ -z $CERT_CN ]]; then
+    printf 'ERROR: Missing -c, a certificate requires a Common Name.\n\n'
+    show_help >&2
+    exit 1
+elif grep -q -P '(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{1,63}(?<!-)\.)+[a-zA-Z]{2,63}$)' <<< "$CERT_CN"; then
+    CERT_CN=${CERT_CN,,}
+    (( $VERBOSE > 0 )) && printf 'Certificate Common Name: %s\n' "$CERT_CN"
+else
+    printf 'ERROR: Invalid FQDN given for CERT_CN: %s\n' "$CERT_CN"
+fi
+
+# Check that credentials are available
+CRED_FILE=${CRED_FILE:=/etc/ipa/.pfsrc}
+if sudo test ! -f "$CRED_FILE"; then
+    printf "ERROR: File not found: $CRED_FILE\n"
+    exit 5
+elif [ $(sudo grep "OPENSSH PRIVATE KEY" "$CRED_FILE" -c) -ne 2 ]; then
+    printf "ERROR: No key header found: $CRED_FILE\n"
+    exit 5
+else
+    (( $VERBOSE > 0 )) && printf "Private key found in: $CRED_FILE\n"
+fi
+
+# Check that the IPv4 address is valid if parsed
+if [[ ! -z $IP4 ]]; then
+    if [[ $IP4 == "CERT_CN" ]]; then
+        IP4=$(dig +short "$CERT_CN")
+    elif expr "$OPTARG" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' >/dev/null; then
+        IPS=.
+        set $OPTARG
+        for quad in 1 2 3 4; do
+            if eval [ \$$quad -gt 255 ]; then
+                printf 'ERROR: Invalid IPv4 address provided: %s\n' "$OPTARG"
+                exit 2
+            fi
+        done
+        IP4=$OPTARG
+    else
+        printf 'ERROR: Invalid IPv4 address provided: %s\n' "$OPTARG"
+        exit 2
+    fi
+    IP4_log="  IP4: $IP4\n"
+else
+    IP4_log=""
+fi
+
+# Check that a single valid FQDN was parsed for the pfSense appliance.
+if [[ -z $@ ]]; then
+    PFS_MGMT="$CERT_CN"
+elif grep -q -P '(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$)' <<< "$@"; then
+    PFS_MGMT="${@,,}"
+    printf "  verbose=%d\n  CERT_CN: %s\n$IP4_log  PFS_FQDN: %s\n" "$VERBOSE" "$CERT_CN" "$PFS_MGMT"
+    if ! nc -z $PFS_MGMT 22 2>/dev/null; then
+        printf 'ERROR: pfSense device unreachable at: ssh//%s/ (tcp/22)\n' "$PFS_MGMT"
+        exit 4
+    fi
+else
+    printf 'ERROR: A valid FQDN is required to issue a certificate.\n'
+    printf 'Parsed string: %s\n\n' "$@"
+    show_help >&2
+    exit 4
+fi
+
+# Set the default service for the Service Principal
+if [[ -z $SERVICE ]]; then
+    SERVICE="HTTP"
+fi
+
+# Verify a valid IPA CA Certificate Profile is parsed
+if [[ ! -z $CERT_PROFILE ]]; then
+    if ! (ipa certprofile-find --id="$CERT_PROFILE"); then
+        printf "ERROR: Certificate profile %s doesn't exist\n" "$CERT_PROFILE"
+        exit 6
+    else
+        (( $VERBOSE > 0 )) && printf 'Found certificate profile: %s\n' "$CERT_PROFILE"
+    fi
+fi
+
+# Verify the parsed certificate type and bit length
+if [[ ! -z $TYPE ]]; then
+    TYPE=${TYPE^^}
+    if [[ "$TYPE" =~ ^(RSA|DSA)$ ]]; then
+        if [ "$BITS" -lt 2048 ]; then
+            printf 'ERROR: RSA/DSA key length must be at least 2048 bits\n'
+            exit 6
+        else
+            (( $VERBOSE > 0 )) && printf 'Key type/length: %s/%d' "$TYPE" "$BITS"
+        fi
+    elif [[ "$TYPE" =~ ^(EC|ECDSA)$ ]]; then
+        if [ "$BITS" -lt 256 ]; then
+            printf 'ERROR: EC/ECDSA key longth must be at least 256 bits\n'
+            exit 6
+        else
+            (( $VERBOSE > 0 )) && printf 'Key type/length: %s/%d\n' "$TYPE" "$BITS"
+        fi
+    else
+        printf 'ERROR: Unsupported key type: %s\n' "$TYPE"
+        exit 6
+    fi
+fi
+
+## Options
+# Parse IPA CA Certificate Profile to ipa-getcert
+if [[ -z $CERT_PROFILE ]]; then
+    IPA_OPTS=""
+else
+    IPA_OPTS="-T $CERT_PROFILE"
+fi
+# Parse certificate key type and length to ipa-getcert
+if [[ ! -z $TYPE ]]; then
+    IPA_OPTS="$IPA_OPTS -G $TYPE"
+    if [[ ! -z $BITS ]]; then
+         IPA_OPTS="$IPA_OPTS -g $BITS"
+    fi
+fi
+# Parse IPv4 SAN option to ipa-getcert
+if [[ ! -z $IP4 ]]; then
+    IPA_OPTS="$IPA_OPTS -A $IP4"
+    (( $VERBOSE > 0 )) && echo "IPv4 will be included in the SAN."
+fi
+
+## Requirements
+# Installed packages: ipa-getcert
+
+# Simple check to see if freeipa-client is installed.
+if [[ ! -d /etc/ipa ]]; then
+    echo 'ERROR: /etc/ipa/ does not exist. This script must be run from an enrolled FreeIPA client.'
+    exit 5
+fi
+
+## Request the certificate from FreeIPA
+sudo ipa-getcert request $IPA_OPTS -N $CERT_CN -K HTTP/$CERT_CN -k /etc/ssl/private/${CERT_CN}.key -f /etc/ssl/certs/${CERT_CN}.crt -D $CERT_CN -C "$INST_CERT -c $CERT_CN $PFS_MGMT"
+if (( $VERBOSE > 0 )); then
+    printf 'Certificate requested for: %s\n' "$CERT_CN"
+fi
+
+# Verify state of the certificate is MONITORING, use a 300 second timeout.
+STEP=1
+SECONDS=0
+C_ISSUE=0
+CERT_STAT="requested"
+while [[ $SECONDS -lt 300 ]] && [[ "$CERT_STAT" != "monitoring" ]]; do
+    sleep $STEP
+    (( $VERBOSE > 0 )) && printf '\r  Waiting for status: %d seconds.' "$SECONDS"
+    if [[ $(sudo ipa-getcert status -f /etc/ssl/certs/${CERT_CN}.crt -v) =~ (POST_SAVED_CERT) ]] && [[ "$CERT_STAT" == "requested" ]]; then
+        C_ISSUE=$SECONDS
+        printf '\r  Certificate issue took %d seconds, waiting for the post-save process to finish.\n' "$C_ISSUE"
+        CERT_STAT="post_saved_cert"
+    elif [[ $(sudo ipa-getcert status -f /etc/ssl/certs/${CERT_CN}.crt -v) =~ (MONITORING) ]]; then
+        printf '\r  Certificate install and commit by the post-save process on: %s took %d seconds.\n' "$PFS_MGMT" "$(($SECONDS-$C_ISSUE))"
+        CERT_STAT="monitoring"
+    fi
+done
+if [[ "$CERT_STAT" != "monitoring" ]]; then
+    printf 'ERROR: Problem encountered with the requested certificate or installation.\nManual intervention required for: %s\n' "$CERT_CN"
+    CMD="ipa-getcert status -f /etc/ssl/certs/${CERT_CN}.crt -v"
+    CERT_STATUS=$($CMD)
+    printf ' - Certificate request - %s\nCheck Certmonger status with: %s\n' "${CERT_STATUS,}" "$CMD"
+    printf ' - Once resolved run the following command to deploy the certificate:\n   %s\n' "ipa-getcert resubmit -f /etc/ssl/certs/${CERT_CN}.crt"
+    printf ' - If stuck in POST_SAVED_CERT, then the post-save command likely failed.\n   Check /var/log/pfs_instcert.log, CPU load and abort the post-save process.\n\n'
+    exit 10
+fi
+echo "FINISHED: Check the pfSense appliance to see if the certificate is in use."

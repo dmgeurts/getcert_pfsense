@@ -104,7 +104,12 @@ fi
 SAN_FQDN=""
 if [[ -n $ADD_FQDN ]]; then
     for fqdn in ${ADD_FQDN//,/ }; do
-        SAN_FQDN="${SAN_FQDN}$(host $fqdn &> /dev/null && echo "-D $fqdn " || echo '')"
+        if (host -t A $fqdn &> /dev/null); then
+            SAN_FQDN="${SAN_FQDN} -D $fqdn"
+            printf "Including additional SAN records for: $fqdn\n"
+        else
+            printf "Domain did not resolve, not including: $fqdn\n"
+        fi
     done
 fi
 

@@ -15,6 +15,7 @@ partner script to deploy the certificate to a pfSense appliance via ssh/scp.
     -a CRED_FILE      File with the pfSense admin/root privte key.
                       Defaults to /etc/ipa/.pfsrc
 OPTIONS:
+    -D ADD_FQDN       Additional FQDNs to add to the SAN, comma separated.
     -i                Resolve CERT_CN to an IP address, for inclusion in the SAN.
     -I IP4            IPv4 address of the pfSense server, for inclusion in the SAN.
     -S SERVICE        Service of the Service Principal. Default: HTTP.
@@ -37,11 +38,13 @@ VERBOSE=0
 OPTIND=1
 
 ## Read/interpret optional arguments
-while getopts c:a:iI:S:T:G:b:vh opt; do
+while getopts c:a:D:iI:S:T:G:b:vh opt; do
     case $opt in
         c)  CERT_CN=$OPTARG
             ;;
         a)  CRED_FILE=$OPTARG
+            ;;
+        D)  ADD_FQDN=$OPTARG
             ;;
         i)  IP4="CERT_CN"
             ;;
@@ -97,8 +100,16 @@ else
     (( $VERBOSE > 0 )) && printf "Private key found in: $CRED_FILE\n"
 fi
 
+# Check if extra FQDNs are parsed for inclusion in the SAN
+SAN_FQDN=""
+if [[ -n $ADD_FQDN ]]; then
+    for fqdn in ${ADD_FQDN//,/ }; do
+        SAN_FQDN="${SAN_FQDN}$(host $fqdn &> /dev/null && echo "-D $fqdn " || echo '')"
+    done
+fi
+
 # Check that the IPv4 address is valid if parsed
-if [[ ! -z $IP4 ]]; then
+if [[ -n $IP4 ]]; then
     if [[ $IP4 == "CERT_CN" ]]; then
         IP4=$(dig +short "$CERT_CN")
     elif expr "$OPTARG" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' >/dev/null; then
@@ -143,7 +154,7 @@ if [[ -z $SERVICE ]]; then
 fi
 
 # Verify a valid IPA CA Certificate Profile is parsed
-if [[ ! -z $CERT_PROFILE ]]; then
+if [[ -n $CERT_PROFILE ]]; then
     if ! (ipa certprofile-find --id="$CERT_PROFILE"); then
         printf "ERROR: Certificate profile %s doesn't exist\n" "$CERT_PROFILE"
         exit 6
@@ -153,7 +164,7 @@ if [[ ! -z $CERT_PROFILE ]]; then
 fi
 
 # Verify the parsed certificate type and bit length
-if [[ ! -z $TYPE ]]; then
+if [[ -n $TYPE ]]; then
     TYPE=${TYPE^^}
     if [[ "$TYPE" =~ ^(RSA|DSA)$ ]]; then
         if [ "$BITS" -lt 2048 ]; then
@@ -183,14 +194,14 @@ else
     IPA_OPTS="-T $CERT_PROFILE"
 fi
 # Parse certificate key type and length to ipa-getcert
-if [[ ! -z $TYPE ]]; then
+if [[ -n $TYPE ]]; then
     IPA_OPTS="$IPA_OPTS -G $TYPE"
-    if [[ ! -z $BITS ]]; then
+    if [[ -n $BITS ]]; then
          IPA_OPTS="$IPA_OPTS -g $BITS"
     fi
 fi
 # Parse IPv4 SAN option to ipa-getcert
-if [[ ! -z $IP4 ]]; then
+if [[ -n $IP4 ]]; then
     IPA_OPTS="$IPA_OPTS -A $IP4"
     (( $VERBOSE > 0 )) && echo "IPv4 will be included in the SAN."
 fi
@@ -205,7 +216,7 @@ if [[ ! -d /etc/ipa ]]; then
 fi
 
 ## Request the certificate from FreeIPA
-sudo ipa-getcert request $IPA_OPTS -N $CERT_CN -K HTTP/$CERT_CN -k /etc/ssl/private/${CERT_CN}.key -f /etc/ssl/certs/${CERT_CN}.crt -D $CERT_CN -C "$INST_CERT -c $CERT_CN $PFS_MGMT"
+sudo ipa-getcert request $IPA_OPTS -N $CERT_CN -K HTTP/$CERT_CN -k /etc/ssl/private/${CERT_CN}.key -f /etc/ssl/certs/${CERT_CN}.crt -D $CERT_CN $SAN_FQDN -C "$INST_CERT -c $CERT_CN $PFS_MGMT"
 if (( $VERBOSE > 0 )); then
     printf 'Certificate requested for: %s\n' "$CERT_CN"
 fi

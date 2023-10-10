@@ -68,6 +68,7 @@ partner script to deploy the certificate to a pfSense appliance via ssh/scp.
     -a CRED_FILE      File with the pfSense admin/root privte key.
                       Defaults to /etc/ipa/.pfsrc
 OPTIONS:
+    -D ADD_FQDN       Additional FQDNs to add to the SAN, comma separated.
     -i                Resolve CERT_CN to an IP address, for inclusion in the SAN.
     -I IP4            IPv4 address of the pfSense server, for inclusion in the SAN.
     -S SERVICE        Service of the Service Principal. Default: HTTP.

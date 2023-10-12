@@ -116,8 +116,7 @@ else
     # replace the placeholder string in the pattern template with certificate information.
     # awk is used because of the escape characters aren't passed via sed.
     SCP_FILE="/tmp/${CERT_CN}.sub"
-#    printf '/.*%s.*/{\nN\nN\n' "$CERT_CN" > "$SCP_FILE"
-    printf '/.*%s.*/{\nN\nN\n' "fw04-mgmt-2021" > "$SCP_FILE"
+    printf '/.*%s.*/{\nN\nN\n' "$CERT_CN" > "$SCP_FILE"
     printf '/<crt>.*<\/crt>/{\ns//<crt>%s<\/crt>/\n}\nN\nN\n' "$CRT" >> "$SCP_FILE"
     printf '/<prv>.*<\/prv>/{\ns//<prv>%s<\/prv>/\nP\nD\n}\n}' "$KEY" >> "$SCP_FILE"
 fi

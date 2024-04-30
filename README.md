@@ -34,10 +34,8 @@ Image TBD
 
 There are two scripts:
 
-"pfs_getcert" --> https://github.com/dmgeurts/getcert_pfsense/edit/master/fps_getcert
-Obtains a certificate from FreeIPA and sets the post-save to use pfs_instcert for automatic installation of a renewed certificate.
-"pfs_instcert" --> https://github.com/dmgeurts/getcert_pfsense/edit/master/pfs_instcert
-Installs the certificate on a pfSense appliance.
+["pfs_getcert"](https://github.com/dmgeurts/getcert_pfsense/edit/master/fps_getcert) - Obtains a certificate from FreeIPA and sets the post-save to use pfs_instcert for automatic installation of a renewed certificate.  
+["pfs_instcert"](https://github.com/dmgeurts/getcert_pfsense/edit/master/pfs_instcert) - Installs the certificate on a pfSense appliance.
 
 # How It Works
 
